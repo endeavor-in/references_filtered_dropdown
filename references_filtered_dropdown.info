@@ -1,0 +1,9 @@
+name = References filtered dropdown
+description = References field provided with a new widget of 'filtered dropdown'
+package = Fields
+core = 7.x
+dependencies[] = references
+dependencies[] = views
+
+core = "7.x"
+

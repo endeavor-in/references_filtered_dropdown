@@ -1,0 +1,681 @@
+<?php 
+
+/**
+ * Implements hook_field_widget_form_alter().
+ * This is used to insert views exposed filter
+ * to the 'references' field types
+ */
+function references_filtered_dropdown_field_widget_form_alter(&$element, &$form_state, $context) {
+  if (($context['field']['type'] == 'node_reference' || $context['field']['type'] == 'user_reference') && $context['field']['settings']['global_search'] == false) {
+    if (isset($context['field']['settings']['view'])) {      
+      $view_name = $context['field']['settings']['view']['view_name'];
+      $display_name = $context['field']['settings']['view']['display_name'];
+      $view = views_get_view($view_name);
+      $display = $view->display[$display_name];
+      $view->set_display($display_name);
+      $view->init_handlers();
+      $exposed_form_plugin = new views_plugin_exposed_form();
+      $options['submit_button'] = null;
+      $exposed_form_plugin->init($view, $display,$options);
+      $exposed_form_state = array(
+        'view' => $view,
+        'display' => $display,
+        'method' => 'get',
+        'rerender' => TRUE,
+        'no_redirect' => TRUE,
+        'always_process' => TRUE,
+        'exposed_form_plugin' => $exposed_form_plugin,
+        'must_validate' => TRUE,
+        'input' => $view->get_exposed_input(),
+        'exposed' => true,
+      );
+      // Creating wrapper id for filtered dropdown select.
+      $wrapper_id = 'wrapper';
+      $field_parents = $element['#field_parents'];
+      while (count($field_parents)) {
+        $temp_key = array_shift($field_parents);
+        $wrapper_id .= '-' . $temp_key;
+      }
+      $wrapper_id .= '-' . $element['#field_name'] . '-' . $element['#language'] . '-' . $element['#delta'];
+      $old_element = $element;
+
+      $element = array(
+        '#type' => 'container',
+        '#tree' => true 
+      );
+      
+      $element['exposed_filters'] = array(
+        '#title' => 'Search Filters for ' . $old_element['#title'],
+        '#type' => 'fieldset',
+        '#tree' => true,
+        '#collapsible' => true,
+        '#collapsed' => true
+      );
+      $exposed_form = $element['exposed_filters'];
+      
+      $exposed_form['#info'] = array();
+      if (!variable_get('clean_url', FALSE)) {
+        $exposed_form['q'] = array(
+          '#type' => 'hidden',
+          '#value' => $view->get_url(),
+        );
+      }
+      // Go through each filter handler and let it generate its exposed widget.      
+      foreach ($view->filter as $id => $handler) {
+        if ($handler->can_expose() && $handler->is_exposed()) {
+          $handler->exposed_form($exposed_form, $exposed_form_state); 
+          if ($info = $handler->exposed_info()) {
+            $exposed_form['#info']["filter-$id"] = $info;
+          }        
+        }
+      } 
+      $filter_fields = array();
+      foreach(element_get_visible_children($exposed_form) as $key) {
+        // add ajax behaviours
+        $exposed_form[$key]['#ajax'] = array(
+          'callback' => 'references_filtered_dropdown_ajax',
+          'wrapper' => $wrapper_id
+        );
+        
+        // Retrieve and assign label
+        $search = array('field','_');
+        $replace = array('',' ');
+        $label = ucwords(str_replace($search,$replace,$key));
+        $exposed_form[$key]['#title'] = $label;
+        
+        // ajax process the filters
+        unset($exposed_form[$key]['#ajax_processed']); 
+        $exposed_form[$key]['#pre_render'][] = 'ajax_pre_render_element';
+        $element['exposed_filters'][$key] = $exposed_form[$key];
+        $element['exposed_filters'][$key]['#tree'] = true;
+        $filter_fields[] = $key;
+      }
+      // hidden element to store Views related info
+      $references_field_info = array(
+        'view_name' => $view_name,
+        'display_name' => $display_name,
+        'filter_fields' => $filter_fields,
+        'references_field' => $old_element['#field_name'],
+        'references_langcode' => $old_element['#language'],
+        'references_parents' => $old_element['#field_parents'],
+        'field_collection_name' => $old_element['#bundle'],
+      ); 
+      $references_field_info_serialized = serialize($references_field_info);
+      $element['exposed_filters']['references_field_info'] = array(
+        '#type' => 'hidden',
+        '#value' => $references_field_info_serialized
+      );
+      
+      $element['filtered_dropdown'] = $old_element;
+      $element['filtered_dropdown']['#prefix'] = '<div id="' . $wrapper_id . '">';
+      $element['filtered_dropdown']['#suffix'] = '</div>';       
+    } 
+  }
+}
+
+/**
+ * Callback function for exposed filters, to change the dropdown options
+ */
+function references_filtered_dropdown_ajax($form,$form_state) {
+  $triggering_element = $form_state['triggering_element'];  
+  $parents = $triggering_element['#parents'];
+  $exposed_form_values =& $form_state['values'];
+  while (count($parents) > 1) {
+    $temp_key = array_shift($parents);
+    $exposed_form_values =& $exposed_form_values[$temp_key];
+  }  
+  $references_field_info = unserialize($exposed_form_values['references_field_info']);
+
+  // get filtered reference options from field widget alter
+  $view_name = $references_field_info['view_name'];
+  $display_name = $references_field_info['display_name'];
+  $filter_fields = $references_field_info['filter_fields'];
+  $reference_field_name = $references_field_info['references_field'];
+  $lang_code = $references_field_info['references_langcode'];
+  $references_parents = $references_field_info['references_parents'];
+  $field_collection_name = $references_field_info['field_collection_name'];
+  $view = views_get_view($view_name);
+  $view->set_display($display_name);
+  $view->init_handlers();
+  foreach($filter_fields as $field_name) {
+    $handler_class = get_class($view->display_handler->handlers['filter'][$field_name]);
+    switch ($handler_class) {
+      case 'views_handler_filter_boolean_operator':
+      case 'views_handler_filter_string':
+        $view->display_handler->handlers['filter'][$field_name]->value = $exposed_form_values[$field_name];
+        break;
+      case 'views_handler_filter_node_type':
+        $type = $exposed_form_values[$field_name];
+        if($type != 'All') {
+          $view->display_handler->handlers['filter'][$field_name]->value = array($type => $type);
+        }  
+        break;
+      case 'views_handler_filter_term_node_tid':
+        $tid = $exposed_form_values[$field_name];
+        if (is_numeric($tid)) {
+          $view->display_handler->handlers['filter'][$field_name]->value = array($tid => $tid);
+        }
+        break;
+      case 'views_handler_filter_field_list':
+        $list =  $exposed_form_values[$field_name];
+        $view->display_handler->handlers['filter'][$field_name]->value = array($list => $list);
+        break;
+      case 'views_handler_filter_date':
+        $date = $exposed_form_values[$field_name];
+        if(!$date) {
+          $date = date('Y-m-d',0);
+        }
+        $view->display_handler->handlers['filter'][$field_name]->value['value'] = $date;
+        break;    
+    }
+  }
+  
+  //Setting references_options based on the reference type(node or user) and Field collection.
+  if(isset($form_state['field']['#parents'])) {
+    if($form_state['field']['#parents'][$field_collection_name][$lang_code][0]['#fields'][$reference_field_name][$lang_code]['field']['type'] == 'node_reference') {
+      $references_options = array(
+        'ids' => array(),
+        'title_field' => 'title',
+        'string' => '',
+        'match' => 'contains',
+      );
+    }
+    elseif($form_state['field']['#parents'][$field_collection_name][$lang_code][0]['#fields'][$reference_field_name][$lang_code]['field']['type'] == 'user_reference') {
+      $references_options = array(
+        'ids' => array(),
+        'title_field' => 'name',
+        'string' => '',
+        'match' => 'contains',
+      );
+    }
+  }
+  // If there is no field collection.
+  elseif(isset($form_state['field'][$reference_field_name][$lang_code]['field'])) {
+    
+    if($form_state['field'][$reference_field_name][$lang_code]['field']['type'] == 'node_reference') {
+      $references_options = array(
+        'ids' => array(),
+        'title_field' => 'title',
+        'string' => '',
+        'match' => 'contains',
+      );
+    }
+    elseif($form_state['field'][$reference_field_name][$lang_code]['field']['type'] == 'user_reference') {
+      $references_options = array(
+        'ids' => array(),
+        'title_field' => 'name',
+        'string' => '',
+        'match' => 'contains',
+      );
+    }
+  } 
+  $view->display_handler->set_option('references_options', $references_options);
+  $result = $view->execute_display($display_name);
+  $field_options = array();
+  foreach ($result as $key => $value) {
+    $label = html_entity_decode(strip_tags($value['rendered']), ENT_QUOTES);
+    $field_options[$key] = $label;
+  }
+  // return the modified references field 
+  $myForm =& $form;
+  while (count($references_parents)) {
+    $temp_key = array_shift($references_parents);
+    $myForm =& $myForm[$temp_key];
+  }
+  $myForm =& $myForm[$reference_field_name][$lang_code]['filtered_dropdown'];
+  $myForm['#options'] = $field_options;
+  return $myForm;  
+
+}
+
+/**
+ * 
+ * Unset the $_SESSION every time form gets created.
+ * @param $node
+ */
+function references_filtered_dropdown_node_prepare($node) {
+  if(isset($_SESSION['global_search_field_info'])) {
+    unset($_SESSION['global_search_field_info']);
+  }
+}
+
+
+/**
+ * Implementation of hook form alter, to add a custom submit handler
+ * Enter description here ...
+ * @param $form
+ * @param $form_state
+ * @param $form_id
+ */
+function references_filtered_dropdown_form_alter(&$form,&$form_state,$form_id) {
+  $k=0;
+  if(strpos($form_id,'_node_form') !== false) {
+    if(isset($form_state['field']['#parents'])) {
+      $field_collections = $form_state['field']['#parents'];
+      if (count($field_collections) == 1) {
+        $field_collection_name = key($field_collections);
+        $field_collection = current($field_collections);
+        $lang_code = $form[$field_collection_name]['#language'];
+        $field_collection_items = $field_collection[$lang_code];
+        
+        foreach ($field_collection_items as $field_collection_item) {
+          $fields = $field_collection_item['#fields'];
+          $reference_field_name = key($fields);
+          $reference_field = references_filtered_dropdown_get_reference_field($fields,$lang_code);
+          /* Check whether reference_field have only one reference type
+             either node reference or user reference
+          */
+          if ($reference_field) {
+            $settings = $reference_field[$lang_code]['field']['settings'];
+            
+            if($settings['global_search'] == true) {           
+              
+              //if (!isset($_SESSION['global_search_field_info'] )) {
+                $view_details = $settings['view'];
+                if(isset($view_details)) {
+                  $view_name = $view_details['view_name'];
+                  $display_name = $view_details['display_name'];
+                  $view = views_get_view($view_name);
+                  $display = $view->display[$display_name];
+                  $view->set_display($display_name);
+                  $view->init_handlers();
+                  $exposed_form_plugin = new views_plugin_exposed_form();
+                  $options['submit_button'] = NULL;
+                  $exposed_form_plugin->init($view, $display,$options);
+                  $exposed_form_state = array(
+                    'view' => $view,
+                    'display' => $display,
+                    'method' => 'get',
+                    'rerender' => TRUE,
+                    'no_redirect' => TRUE,
+                    'always_process' => TRUE,
+                    'exposed_form_plugin' => $exposed_form_plugin,
+                    'must_validate' => TRUE,
+                    'input' => $view->get_exposed_input(),
+                    'exposed' => true,
+                  );      
+                }
+               
+                $is_field_collection = $form_state['field'][$field_collection_name][$lang_code]['field']['type'];
+                if($is_field_collection == 'field_collection') {
+                  
+                  $field_collection_weight = $form[$field_collection_name]['#weight'];
+                  $exposed_filters_weight = $field_collection_weight-1;
+                  $search = array('field','_');
+                  $replace = array('',' ');
+                  $field_name_title = ucwords(str_replace($search,$replace,$reference_field_name));
+                  
+                  $form['exposed_filters'] = array(
+                    '#title' => 'Search Filters for '.$field_name_title,
+                    '#type' => 'fieldset',
+                    '#tree' => true,
+                    '#collapsible' => true,
+                    '#collapsed' => true,
+                    '#weight' => $exposed_filters_weight,
+                  );
+                }
+                $exposed_form = $form['exposed_filters'];
+      
+                $exposed_form['#info'] = array();
+                if (!variable_get('clean_url', FALSE)) {
+                  $exposed_form['q'] = array(
+                    '#type' => 'hidden',
+                    '#value' => $view->get_url(),
+                  );
+                }
+                // Go through each filter handler and let it generate its exposed widget.      
+                foreach ($view->filter as $id => $handler) {
+                  if ($handler->can_expose() && $handler->is_exposed()) {
+                    $handler->exposed_form($exposed_form, $exposed_form_state); 
+                    if ($info = $handler->exposed_info()) {
+                      $exposed_form['#info']["filter-$id"] = $info;
+                    }        
+                  }
+                }
+                  
+                $filter_fields = array();
+                foreach(element_get_visible_children($exposed_form) as $key) {
+                  // add ajax behaviours
+                  $exposed_form[$key]['#ajax'] = array(
+                    'callback' => 'references_filtered_dropdown_global_ajax',
+                    'wrapper' => 'wrapper-global-reference',
+                  );
+                  // Retrieve and assign label
+                  $search = array('field','_');
+                  $replace = array('',' ');
+                  $label = ucwords(str_replace($search,$replace,$key));
+                  $exposed_form[$key]['#title'] = $label;
+                  // ajax process the filters
+                  unset($exposed_form[$key]['#ajax_processed']); 
+                  $exposed_form[$key]['#pre_render'][] = 'ajax_pre_render_element';
+                  $form['exposed_filters'][$key] = $exposed_form[$key];
+                  $form['exposed_filters'][$key]['#tree'] = true;
+                  $filter_fields[] = $key;
+                }
+                
+                // Unset the session whenever exposed filter is triggered
+                if(isset($form_state['triggering_element'])) {
+                  $tiggering_element_name = $form_state['triggering_element']['#name'];
+                  $field_value = key($form_state['values']['exposed_filters']);
+                  $exposed_filter_name = 'exposed_filters['.$field_value.']';
+                  if($tiggering_element_name == $exposed_filter_name) {
+                    if(isset($_SESSION['global_search_field_info']['filter_value'])) {
+                      unset($_SESSION['global_search_field_info']['filter_value']);
+                    }
+                  }
+                }
+                
+                if (!isset($_SESSION['global_search_field_info'])) {
+                  $_SESSION['global_search_field_info'] = array (
+                    'field_collection' => $field_collection,
+                    'field_collection_name' => $field_collection_name,
+                    'reference_field_name' => $reference_field_name,
+                    'lang_code' => $lang_code,
+                    'view_name' => $view_name,
+                    'display_name' => $display_name,
+                    'filter_fields' => $filter_fields,
+                  );
+                }
+                $form[$field_collection_name]['#prefix'] = '<div id ="wrapper-global-reference">';
+                $form[$field_collection_name]['#suffix'] = '</div>'; 
+                $k=0;                          
+                if(isset($_SESSION['global_search_field_info']['filter_value'])) {
+                  foreach($filter_fields as $field_name) {
+                    $filter_value_array = $_SESSION['global_search_field_info']['filter_value'];
+                    $handler_class = get_class($view->display_handler->handlers['filter'][$field_name]);
+                    switch ($handler_class) {
+                      case 'views_handler_filter_boolean_operator':
+                      case 'views_handler_filter_string':
+                        $view->display_handler->handlers['filter'][$field_name]->value = $filter_value_array[$field_name];
+                        break;
+                      case 'views_handler_filter_node_type':
+                        $type = $filter_value_array[$field_name];
+                        if($type != 'All') {
+                          $view->display_handler->handlers['filter'][$field_name]->value = array($type => $type); 
+                        }
+                        break;   
+                      case 'views_handler_filter_term_node_tid':
+                        $tid = $filter_value_array[$field_name];
+                        if (is_numeric($tid)) {
+                          $view->display_handler->handlers['filter'][$field_name]->value = array($tid => $tid);
+                        }  
+                        break;
+                      case 'views_handler_filter_field_list':
+                        $list =  $filter_value_array[$field_name];
+                        $view->display_handler->handlers['filter'][$field_name]->value = array($list => $list);
+                        break;
+                      case 'views_handler_filter_date':
+                        $date = $filter_value_array[$field_name];
+                        if(!$date) {
+                          $date = date('Y-m-d',0);
+                        }
+                        $view->display_handler->handlers['filter'][$field_name]->value['value'] = $date;
+                        break;       
+                    }
+                  }
+                  
+                  //Setting references_options based on the reference type(node or user).
+                  if($form_state['field']['#parents'][$field_collection_name][$lang_code][0]['#fields'][$reference_field_name][$lang_code]['field']['type'] == 'node_reference') {
+                    $references_options = array(
+                      'ids' => array(),
+                      'title_field' => 'title',
+                      'string' => '',
+                      'match' => 'contains',
+                    );
+                  }
+                  elseif($form_state['field']['#parents'][$field_collection_name][$lang_code][0]['#fields'][$reference_field_name][$lang_code]['field']['type'] == 'user_reference') {
+                     $references_options = array(
+                      'ids' => array(),
+                      'title_field' => 'name',
+                      'string' => '',
+                      'match' => 'contains',
+                    );
+                  }
+  
+                  $view->display_handler->set_option('references_options', $references_options);
+                  $result = $view->execute_display($display_name);
+                  $field_options = array();
+                  $html_options = '';
+                  foreach ($result as $key => $value) {
+                    $label = html_entity_decode(strip_tags($value['rendered']), ENT_QUOTES);
+                    $field_options[$key] = $label;
+                  }
+                  //$field_collection_deltas = array_keys($form[$field_collection_name][$references_langcode]);
+                  $field_collection_deltas = $form[$field_collection_name][$lang_code];
+                  foreach($field_collection_deltas as $delta => $deltas) {
+                    if(is_int($delta)) {
+                      $form[$field_collection_name][$lang_code][$delta][$reference_field_name][$lang_code]['#options'] = $field_options;
+                    }
+                  }
+                }
+            }
+            break;
+          }
+        }                                                                                       
+      }
+    }
+    
+    if (strpos($form_id,'_node_form') !== false || $form_id == 'field_collection_item_form') {
+      if (!isset($form['actions']['submit']['#submit'])) {
+        $form['actions']['submit']['#submit'] = array();
+      }
+      $form['actions']['submit']['#submit'] = array_merge(
+        array('references_filtered_dropdown_submit_handler'),
+        $form['actions']['submit']['#submit']  
+      );
+    }
+  }
+}  
+
+/**
+ * 
+ * Find whether field collection have more than one reference
+ * @param unknown_type $fields
+ * @param unknown_type $lang_code
+ */
+function references_filtered_dropdown_get_reference_field($fields,$lang_code)  {
+  $reference = null;
+  foreach ($fields as $field) {
+    if ($field[$lang_code]['field']['type'] == 'node_reference' || $field[$lang_code]['field']['type'] == 'user_reference') {
+      if (!$reference) {
+        $reference = $field;
+      }
+      else {
+        return null; // If more than one reference field, no global filter
+      }
+    }
+  }
+  return $reference;
+}
+
+/**
+ * 
+ * Initializing global_search check box option to the 'field ui field edit form'
+ * @param $info
+ */
+function references_filtered_dropdown_field_info_alter(&$info) {
+  // Add a setting to all field types.
+  $info['node_reference']['settings']['global_search'] = false;
+  $info['user_reference']['settings']['global_search'] = false;
+}
+
+/**
+ * 
+ * Adding 'global_search' check box option to the 'field ui field edit form'.
+ * @param $form
+ * @param $form_state
+ * @param $form_id
+ */
+function references_filtered_dropdown_form_field_ui_field_edit_form_alter(&$form,&$form_state,$form_id) {
+  if ($form['#field']['type'] == 'node_reference' || $form['#field']['type'] == 'user_reference') {
+    $global_search = $form['#field']['settings']['global_search'];
+    $form['field']['settings']['global_search'] = array(
+      '#title' => 'Global Search Filter',
+      '#description' => 'Check this to apply one global filter to all the reference fields in a page',
+      '#type' => 'checkbox',
+      '#default_value' => $global_search,
+    );
+  }
+}
+
+/**
+ * 
+ * Callback function for global exposed filters, to change the dropdown options
+ * @param unknown_type $form
+ * @param unknown_type $form_state
+ */
+function references_filtered_dropdown_global_ajax($form,$form_state) {
+  $triggering_element = $form_state['triggering_element'];
+  $parents = $triggering_element['#parents'];
+  $exposed_form_values =& $form_state['values'];
+  while (count($parents) > 1) {
+    $temp_key = array_shift($parents);
+    $exposed_form_values =& $exposed_form_values[$temp_key];
+  }
+    
+  // Getting global_search_field_info from session
+  
+  $view_name = $_SESSION['global_search_field_info']['view_name'];
+  $display_name = $_SESSION['global_search_field_info']['display_name'];
+  $filter_fields = $_SESSION['global_search_field_info']['filter_fields'];
+  $field_collection_name = $_SESSION['global_search_field_info']['field_collection_name'];
+  $lang_code = $_SESSION['global_search_field_info']['lang_code'];
+  $references_field_name = $_SESSION['global_search_field_info']['reference_field_name'];
+  
+  $view = views_get_view($view_name);
+  $view->set_display($display_name);
+  $view->init_handlers();
+  foreach($filter_fields as $field_name) {
+    $_SESSION['global_search_field_info']['filter_value'][$field_name] = $exposed_form_values[$field_name];
+    $handler_class = get_class($view->display_handler->handlers['filter'][$field_name]);
+    switch ($handler_class) {
+      case 'views_handler_filter_boolean_operator':
+      case 'views_handler_filter_string':
+        $view->display_handler->handlers['filter'][$field_name]->value = $exposed_form_values[$field_name];
+        break;
+      case 'views_handler_filter_node_type':
+        $type = $exposed_form_values[$field_name];
+        if($type != 'All') {
+          $view->display_handler->handlers['filter'][$field_name]->value = array($type => $type);
+        }
+        break;
+      case 'views_handler_filter_term_node_tid':
+        $tid = $exposed_form_values[$field_name];
+        if (is_numeric($tid)) {
+          $view->display_handler->handlers['filter'][$field_name]->value = array($tid => $tid);
+        }  
+        break;
+      case 'views_handler_filter_field_list':
+        $list =  $exposed_form_values[$field_name];
+        $view->display_handler->handlers['filter'][$field_name]->value = array($list => $list);
+        break;
+      case 'views_handler_filter_date':
+        $date = $exposed_form_values[$field_name];
+        if(!$date) {
+          $date = date('Y-m-d',0);
+        }
+        $view->display_handler->handlers['filter'][$field_name]->value['value'] = $date;
+        break;
+    }
+  }
+  //Setting references_options based on the reference type(node or user).
+  if(isset($form_state['field']['#parents'])) {
+    if($form_state['field']['#parents'][$field_collection_name][$lang_code][0]['#fields'][$references_field_name][$lang_code]['field']['type'] == 'node_reference') {
+      $references_options = array(
+        'ids' => array(),
+        'title_field' => 'title',
+        'string' => '',
+        'match' => 'contains',
+      );
+    }
+    elseif($form_state['field']['#parents'][$field_collection_name][$lang_code][0]['#fields'][$references_field_name][$lang_code]['field']['type'] == 'user_reference') {
+       $references_options = array(
+        'ids' => array(),
+        'title_field' => 'name',
+        'string' => '',
+        'match' => 'contains',
+      );
+    }
+  }
+  
+  $view->display_handler->set_option('references_options', $references_options);
+  $result = $view->execute_display($display_name);
+  $field_options = array();
+  $html_options = '';
+  foreach ($result as $key => $value) {
+    $label = html_entity_decode(strip_tags($value['rendered']), ENT_QUOTES);
+    $field_options[$key] = $label;
+  }
+  //$field_collection_deltas = array_keys($form[$field_collection_name][$references_langcode]);
+  $field_collection_deltas = $form[$field_collection_name][$lang_code];
+  foreach($field_collection_deltas as $delta => $deltas) {
+    if(is_int($delta)) {
+      $form[$field_collection_name][$lang_code][$delta][$references_field_name][$lang_code]['#options'] = $field_options;
+    }
+  }
+  return $form[$field_collection_name];
+}
+
+/**
+ * Clean up the form state node reference values, as the widget alter messes them up 
+ * @param $form
+ * @param $form_state
+ */
+function references_filtered_dropdown_submit_handler($form,&$form_state) {
+  references_filtered_dropdown_recursive_alter($form_state['values'],'filtered_dropdown');
+  // special case - node references inside field collections
+  if (isset($form_state['node'])) {
+    $language = $form_state['node']->language;
+    foreach (element_children($form_state['field']) as $field_name) {
+      if ($form_state['field'][$field_name][$language]['field']['type'] == 'field_collection') {
+        $items = $form_state['values'][$field_name][$language];
+        foreach ($items as $item) {
+          if (is_array($item)) {
+            $entity = $item['entity'];
+            if (is_object($entity)) {
+              foreach ($item as $key => $value) {
+                if (strpos($key,'field_') !== false) {
+                  // this will correct the node reference values, if any
+                  $entity->{$key} = $value;                   
+                }
+              } 
+            }      
+          }
+        }    
+      }
+    }   
+  }
+  elseif (isset($form_state['field_collection_item'])) {
+    // calling the default submit function, as it seems to be overridden by our handler
+    field_collection_item_form_submit($form, $form_state); 
+  }
+}
+
+/**
+ * A helper function to fix the node reference values submitted
+ * @param unknown_type $ancestor
+ * @param unknown_type $element_key
+ * @param unknown_type $descendant
+ */
+function references_filtered_dropdown_recursive_alter(&$ancestor,$element_key,$descendant=null) {
+  static $parents = array();
+  if (!$descendant) {
+    $descendant = $ancestor;
+  }
+  foreach ($descendant as $key => $value) {
+    if ($key === $element_key) {
+      $my_array =& $ancestor;
+      $tmp_parents = $parents;
+      while (count($tmp_parents)) {
+        $temp_key = array_shift($tmp_parents);
+        $my_array =& $my_array[$temp_key];  
+      }
+      $my_array = $value; // remove 'filtered_dropdown' & 'exposed filters' from the tree                            
+    }
+    elseif (is_array($value) && count($value)) {
+      array_push($parents,$key);
+      references_filtered_dropdown_recursive_alter($ancestor,$element_key,$value);              
+    }    
+  }
+  array_pop($parents);     
+}  
